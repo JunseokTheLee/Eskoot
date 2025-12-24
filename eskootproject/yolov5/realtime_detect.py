@@ -8,7 +8,7 @@ from utils.torch_utils import select_device
 from utils.augmentations import letterbox
 
 # ---------------- CONFIG ----------------asdf
-WEIGHTS = "runs/train/roadhazards_y5n_mps_safe7/weights/best.pt"
+WEIGHTS = "runs/train/roadhazards_y5n3/weights/best.pt"
 IMG_SIZE = 640
 CONF_THRES = 0.15
 IOU_THRES = 0.45
@@ -16,7 +16,7 @@ CAMERA_INDEX = 0
 # ----------------------------------------
 
 # Device (CPU / MPS / CUDA)
-device = select_device("mps")  # "cpu", "mps", or "0"
+device = select_device("cpu")  # "cpu", "mps", or "0"
 VIDEO_PATH = "./01_10072023.mp4"
 # Load model
 model = DetectMultiBackend(WEIGHTS, device=device)
@@ -30,6 +30,9 @@ model.model.half() if fp16 else None
 cap = cv2.VideoCapture(VIDEO_PATH)
 
 while cap.isOpened():
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    slowdown = 2.0   # 2.0 = 2× slower, 3.0 = 3× slower
+    delay = int((1000 / fps) * slowdown)
     ret, frame = cap.read()
     if not ret:
         break
@@ -78,7 +81,8 @@ while cap.isOpened():
                 )
 
     cv2.imshow("Road Hazard Detection", frame)
-    if cv2.waitKey(1) & 0xFF == ord("q"):
+    
+    if cv2.waitKey(delay) & 0xFF == ord("q"):
         break
 
 cap.release()
