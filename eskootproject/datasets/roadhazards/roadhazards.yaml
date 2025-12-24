@@ -1,0 +1,8 @@
+path: /Users/jayden/Documents/eskootproject/datasets/roadhazards
+train: images/train
+val: images/val
+
+names:
+  0: pothole
+  1: crack
+  2: manhole
