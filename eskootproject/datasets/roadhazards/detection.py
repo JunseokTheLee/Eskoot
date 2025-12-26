@@ -3,14 +3,15 @@ import torch
 import torchvision
 import numpy as np
 from torchvision.transforms import v2 as T
-
+import time
+from collections import deque
 # ---------------- CONFIG ----------------
 WEIGHTS = "ssdlite_mobilenetv3_roadhazards.pth"
 IMG_SIZE = 320
 CONF_THRES = 0.25
 VIDEO_PATH = "./01_10072023.mp4"   # or 0 for webcam
 # ----------------------------------------
-
+fps_buffer = deque(maxlen=30) 
 CLASS_NAMES = ["pothole", "crack", "manhole"]
 NUM_CLASSES = len(CLASS_NAMES) + 1  # background
 
@@ -42,6 +43,7 @@ while cap.isOpened():
     slowdown = 2.0   # 2.0 = 2× slower, 3.0 = 3× slower
     delay = int((1000 / fps) * slowdown)
     ret, frame = cap.read()
+    start_time = time.time()
     if not ret:
         break
 
@@ -87,6 +89,19 @@ while cap.isOpened():
             color,
             2
         )
+    end_time = time.time()
+    frame_time = end_time - start_time
+    fps_buffer.append(1.0 / frame_time)
+    fps = sum(fps_buffer) / len(fps_buffer)
+    cv2.putText(
+        frame,
+        f"FPS: {fps:.2f}",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 255, 0),
+        2
+    )
 
     cv2.imshow("Road Hazard Detection (MobileNet)", frame)
     if cv2.waitKey(delay) & 0xFF == ord("q"):

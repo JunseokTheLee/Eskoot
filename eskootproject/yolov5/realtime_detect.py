@@ -1,7 +1,8 @@
 import cv2
 import torch
 import numpy as np
-
+import time
+from collections import deque
 from models.common import DetectMultiBackend
 from utils.general import non_max_suppression, scale_boxes
 from utils.torch_utils import select_device
@@ -14,7 +15,7 @@ CONF_THRES = 0.15
 IOU_THRES = 0.45
 CAMERA_INDEX = 0
 # ----------------------------------------
-
+fps_buffer = deque(maxlen=30)
 # Device (CPU / MPS / CUDA)
 device = select_device("cpu")  # "cpu", "mps", or "0"
 VIDEO_PATH = "./01_10072023.mp4"
@@ -34,9 +35,10 @@ while cap.isOpened():
     slowdown = 2.0   # 2.0 = 2× slower, 3.0 = 3× slower
     delay = int((1000 / fps) * slowdown)
     ret, frame = cap.read()
+    start_time = time.time()
     if not ret:
         break
-
+        
     # Letterbox resize
     img = letterbox(frame, IMG_SIZE, stride=stride, auto=True)[0]
 
@@ -79,7 +81,19 @@ while cap.isOpened():
                     color,
                     2,
                 )
-
+    end_time = time.time()
+    frame_time = end_time - start_time
+    fps_buffer.append(1.0 / frame_time)
+    fps = sum(fps_buffer) / len(fps_buffer)
+    cv2.putText(
+    frame,
+    f"FPS: {fps:.2f}",
+    (10, 30),
+    cv2.FONT_HERSHEY_SIMPLEX,
+    0.9,
+    (0, 255, 0),
+    2
+)
     cv2.imshow("Road Hazard Detection", frame)
     
     if cv2.waitKey(delay) & 0xFF == ord("q"):
