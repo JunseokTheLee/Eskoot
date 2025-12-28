@@ -1,21 +1,38 @@
 import cv2
+import time
 import torch
 import torchvision
-import numpy as np
-from torchvision.transforms import v2 as T
-import time
 from collections import deque
-# ---------------- CONFIG ----------------
-WEIGHTS = "ssdlite_mobilenetv3_roadhazards.pth"
-IMG_SIZE = 320
-CONF_THRES = 0.25
-VIDEO_PATH = "./01_10072023.mp4"   # or 0 for webcam
-# ----------------------------------------
-fps_buffer = deque(maxlen=30) 
-CLASS_NAMES = ["pothole", "crack", "manhole"]
-NUM_CLASSES = len(CLASS_NAMES) + 1  # background
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ---------------- CONFIG ----------------
+def signal():
+    print("signal sent!")
+ROI_Y_START_FRAC =0.5
+ROY_Y_END_FRAC = 1
+
+SIGNAL_COOLDOWN = 1.0
+last_signal_time = 0.0
+
+WEIGHTS = "ssdlite_mobilenetv3_roadhazards.pth"
+VIDEO_PATH = "./01_10072023.mp4" 
+IMG_SIZE = 320                  
+CONF_THRES = 0.40
+
+
+DETECT_EVERY = 2  
+
+CLASS_NAMES = ["pothole", "crack", "manhole"]
+NUM_CLASSES = len(CLASS_NAMES) + 1  
+DEVICE = torch.device("cpu")
+
+
+torch.set_num_threads(2)
+torch.set_num_interop_threads(1)
+cv2.setUseOptimized(True)
+try:
+    cv2.setNumThreads(1)
+except:
+    pass
 
 # ---------------- LOAD MODEL ----------------
 model = torchvision.models.detection.ssdlite320_mobilenet_v3_large(
@@ -23,89 +40,133 @@ model = torchvision.models.detection.ssdlite320_mobilenet_v3_large(
     num_classes=NUM_CLASSES
 )
 
-ckpt = torch.load(WEIGHTS, map_location=DEVICE)
-model.load_state_dict(ckpt["model"])
-model.to(DEVICE)
+ckpt = torch.load(WEIGHTS, map_location="cpu")
+state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+model.load_state_dict(state, strict=True)
 model.eval()
 
-# ---------------- PREPROCESS ----------------
-transform = T.Compose([
-    T.ToImage(),
-    T.Resize((IMG_SIZE, IMG_SIZE)),
-    T.ToDtype(torch.float32, scale=True),
-])
+# ---------------- TRACE WRAPPER (simple JIT) ----------------
+class TraceWrapper(torch.nn.Module):
+    def __init__(self, m):
+        super().__init__()
+        self.m = m
+
+    def forward(self, x: torch.Tensor):
+        det = self.m([x])[0]
+        return det["boxes"], det["scores"], det["labels"]
+
+wrapped = TraceWrapper(model).eval()
+
+example = torch.zeros(3, IMG_SIZE, IMG_SIZE, dtype=torch.float32)
+net = torch.jit.trace(wrapped, example, strict=False)
+try:
+    net = torch.jit.optimize_for_inference(net)
+except Exception:
+    pass
+net.eval()
 
 # ---------------- VIDEO ----------------
 cap = cv2.VideoCapture(VIDEO_PATH)
+fps_src = cap.get(cv2.CAP_PROP_FPS) or 30.0
+slowdown = 1.0
+delay = int((1000 / fps_src) * slowdown)
 
-while cap.isOpened():
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    slowdown = 2.0   # 2.0 = 2× slower, 3.0 = 3× slower
-    delay = int((1000 / fps) * slowdown)
-    ret, frame = cap.read()
-    start_time = time.time()
-    if not ret:
-        break
+fps_buffer = deque(maxlen=30)
 
-    h, w = frame.shape[:2]
 
-    # BGR → RGB
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+cached_boxes = None
+cached_scores = None
+cached_labels = None
+cached_status = "none"
+cached_best = None  # (x1,y1,x2,y2,name,score)
 
-    # Preprocess
-    img = transform(rgb).unsqueeze(0).to(DEVICE)
+frame_idx = 0
 
-    # Inference
-    with torch.no_grad():
-        output = model(img)[0]
+# ---------------- LOOP ----------------
+with torch.inference_mode():
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    boxes = output["boxes"].cpu().numpy()
-    scores = output["scores"].cpu().numpy()
-    labels = output["labels"].cpu().numpy()
+        t0 = time.time()
+        h, w = frame.shape[:2]
 
-    # Scale boxes back to original frame size
-    sx, sy = w / IMG_SIZE, h / IMG_SIZE
+        frame_idx += 1
+        run_det = (frame_idx % DETECT_EVERY == 0) or (cached_scores is None)
 
-    for box, score, label in zip(boxes, scores, labels):
-        if score < CONF_THRES:
-            continue
+        if run_det:
+            # resize -> RGB
 
-        x1, y1, x2, y2 = box
-        x1, x2 = int(x1 * sx), int(x2 * sx)
-        y1, y2 = int(y1 * sy), int(y2 * sy)
+            y0 = int(h*ROI_Y_START_FRAC)
+            y1 = int(h*ROY_Y_END_FRAC)
+            roi = frame[y0:y1, :]
+            h_roi, w_roi = roi.shape[:2]
+            resized = cv2.resize(roi, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
-        cls = label - 1  # remove background offset
-        name = CLASS_NAMES[cls] if 0 <= cls < len(CLASS_NAMES) else str(label)
+            # HWC uint8 -> CHW float32 [0,1]
+            x = torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
+            x = x.to(dtype=torch.float32).mul_(1.0 / 255.0)
 
-        color = (0, 0, 255) if name in ["pothole", "crack", "manhole"] else (0, 255, 0)
+            boxes, scores, labels = net(x)
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(
-            frame,
-            f"{name} {score:.2f}",
-            (x1, y1 - 6),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2
-        )
-    end_time = time.time()
-    frame_time = end_time - start_time
-    fps_buffer.append(1.0 / frame_time)
-    fps = sum(fps_buffer) / len(fps_buffer)
-    cv2.putText(
-        frame,
-        f"FPS: {fps:.2f}",
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
-        (0, 255, 0),
-        2
-    )
+            cached_boxes, cached_scores, cached_labels = boxes, scores, labels
+            cached_status = "none"
+            cached_best = None
 
-    cv2.imshow("Road Hazard Detection (MobileNet)", frame)
-    if cv2.waitKey(delay) & 0xFF == ord("q"):
-        break
+            if scores.numel() > 0:
+                best_i = int(torch.argmax(scores).item())
+                best_score = float(scores[best_i].item())
+
+                if best_score >= CONF_THRES:
+                    cached_status = "present"
+
+                    box = boxes[best_i]
+                    label = int(labels[best_i].item())
+
+                    # scale box back to original size
+                    sx, sy = w_roi / IMG_SIZE, h_roi / IMG_SIZE
+                    x1 = int(box[0].item() * sx)
+                    yy1 = int(box[1].item() * sy)
+                    x2 = int(box[2].item() * sx)
+                    yy2 = int(box[3].item() * sy)
+                    y1_full = yy1 + y0
+                    y2_full = yy2 + y0
+                    cls = label - 1
+                    name = CLASS_NAMES[cls] if 0 <= cls < len(CLASS_NAMES) else str(label)
+
+                    cached_best = (x1, y1_full, x2, y2_full, name, best_score)
+
+        
+        if cached_best is not None:
+            x1, y1, x2, y2, name, best_score = cached_best
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(frame, f"{name} {best_score:.2f}",
+                        (x1, max(20, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+   
+        now = time.time()
+        if cached_status != "none" and (now - last_signal_time >= SIGNAL_COOLDOWN):
+            signal()
+            last_signal_time = now
+
+   
+        dt = time.time() - t0
+        fps_buffer.append(1.0 / max(dt, 1e-6))
+        fps_avg = sum(fps_buffer) / len(fps_buffer)
+
+        cv2.putText(frame, f"FPS: {fps_avg:.2f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        cv2.putText(frame, f"Status: {cached_status}", (300, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        cv2.putText(frame, f"Detect every: {DETECT_EVERY} frames", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        cv2.imshow("Road Hazard Detection (trace + frame-skip)", frame)
+        if cv2.waitKey(delay) & 0xFF == ord("q"):
+            break
 
 cap.release()
 cv2.destroyAllWindows()
