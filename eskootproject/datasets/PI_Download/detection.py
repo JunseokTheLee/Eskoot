@@ -5,12 +5,17 @@ import torchvision
 from collections import deque
 
 # ---------------- CONFIG ----------------
-def signal():
-    print("signal sent!")
+def leftsignal():
+    print("left signal sent!")
+def rightsignal():
+    print("right signal sent!")
+def frontsignal():
+    print("front signal sent!")
 ROI_Y_START_FRAC =0.5
 ROY_Y_END_FRAC = 1
-
-SIGNAL_COOLDOWN = 1.0
+LANE_LEFT_MAX  = 0.33
+LANE_RIGHT_MIN = 0.66
+SIGNAL_COOLDOWN = 1.5
 last_signal_time = 0.0
 
 WEIGHTS = "ssdlite_mobilenetv3_roadhazards.pth"
@@ -84,7 +89,9 @@ frame_idx = 0
 
 # ---------------- LOOP ----------------
 with torch.inference_mode():
+    frame_count = 0
     while cap.isOpened():
+        frame_count += 1
         ret, frame = cap.read()
         if not ret:
             break
@@ -136,20 +143,31 @@ with torch.inference_mode():
                     cls = label - 1
                     name = CLASS_NAMES[cls] if 0 <= cls < len(CLASS_NAMES) else str(label)
 
-                    cached_best = (x1, y1_full, x2, y2_full, name, best_score)
+                    
+                    cx = 0.5 * (x1 + x2)          # center in full-frame x coords
+                    cx_norm = cx / max(w, 1)      # 0..1
+                    cached_best = (x1, y1_full, x2, y2_full, name, best_score, cx_norm)
+
 
         
         if cached_best is not None:
-            x1, y1, x2, y2, name, best_score = cached_best
+            x1, y1, x2, y2, name, best_score, cx_norm = cached_best
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
             cv2.putText(frame, f"{name} {best_score:.2f}",
                         (x1, max(20, y1 - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-   
+        
         now = time.time()
         if cached_status != "none" and (now - last_signal_time >= SIGNAL_COOLDOWN):
-            signal()
+            _,_, _, _, _, _, cx_norm = cached_best
+            if (cx_norm< LANE_LEFT_MAX):
+                leftsignal()
+            elif (cx_norm>LANE_RIGHT_MIN):
+                rightsignal()
+            else:
+                frontsignal()
+            
             last_signal_time = now
 
    
@@ -165,6 +183,7 @@ with torch.inference_mode():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         cv2.imshow("Road Hazard Detection (trace + frame-skip)", frame)
+        
         if cv2.waitKey(delay) & 0xFF == ord("q"):
             break
 
